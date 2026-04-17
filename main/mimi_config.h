@@ -46,6 +46,26 @@
 #ifndef MIMI_SECRET_TAVILY_KEY
 #define MIMI_SECRET_TAVILY_KEY      ""
 #endif
+/*
+ * Shared secret required to authenticate clients of the WebSocket
+ * gateway on port 18789. When empty (default) the gateway falls back
+ * to an unauthenticated mode but logs a loud warning on startup. Set
+ * this to a long random string in mimi_secrets.h (or via CLI/NVS)
+ * before exposing the device on any untrusted network.
+ */
+#ifndef MIMI_SECRET_WS_AUTH_TOKEN
+#define MIMI_SECRET_WS_AUTH_TOKEN   ""
+#endif
+/*
+ * Optional override for the onboarding Soft AP WPA2 password. Must be
+ * at least 8 characters per WPA2 rules. When empty or too short, the
+ * firmware derives a per-device password from the SoftAP MAC address
+ * and logs it on boot so the operator can read it from the serial
+ * console. The AP is WPA2-protected in all cases — never open.
+ */
+#ifndef MIMI_SECRET_ONBOARD_AP_PASS
+#define MIMI_SECRET_ONBOARD_AP_PASS ""
+#endif
 
 /* WiFi */
 #define MIMI_WIFI_MAX_RETRY          10
@@ -156,7 +176,10 @@
 
 /* WiFi Onboarding (Captive Portal) */
 #define MIMI_ONBOARD_AP_PREFIX    "MimiClaw-"
-#define MIMI_ONBOARD_AP_PASS      ""          /* open network */
+/* WPA2-PSK password for the onboarding Soft AP. Pulled from the
+ * build-time secret if provided, else derived per-device at runtime
+ * (see wifi_onboard.c). We never expose an open network.           */
+#define MIMI_ONBOARD_AP_PASS      MIMI_SECRET_ONBOARD_AP_PASS
 #define MIMI_ONBOARD_HTTP_PORT    80
 #define MIMI_ONBOARD_DNS_STACK    (4 * 1024)
 #define MIMI_ONBOARD_MAX_SCAN     20
