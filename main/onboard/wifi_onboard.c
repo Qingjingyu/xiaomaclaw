@@ -576,7 +576,7 @@ static esp_err_t start_softap(bool keep_sta)
     strncpy((char *)ap_cfg.ap.ssid, ssid, sizeof(ap_cfg.ap.ssid) - 1);
     ap_cfg.ap.ssid_len = strlen(ssid);
 
-    char derived_pass[17] = {0};
+    char derived_pass[32] = {0};
     const char *configured_pass = MIMI_ONBOARD_AP_PASS;
     const char *effective_pass = configured_pass;
     if (!effective_pass || strlen(effective_pass) < 8) {
