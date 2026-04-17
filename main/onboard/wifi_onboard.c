@@ -23,9 +23,161 @@ static const char *TAG = "onboard";
 static httpd_handle_t s_server = NULL;
 static bool s_captive_mode = false;
 
+/*
+ * Default Soft AP subnet used by ESP-IDF's esp_netif AP driver.
+ * Access to sensitive config endpoints (/config, /save, /scan) is
+ * restricted to clients that connect via the Soft AP (192.168.4.0/24)
+ * so that devices on the user's home LAN cannot reach them over the
+ * STA interface while the admin portal is running.
+ */
+#define MIMI_ONBOARD_AP_SUBNET   0xC0A80400u  /* 192.168.4.0 */
+#define MIMI_ONBOARD_AP_NETMASK  0xFFFFFF00u  /* /24          */
+
+/*
+ * Returns true if the HTTP request originated from a client connected
+ * to the device's Soft AP. Uses getpeername on the underlying socket.
+ * If the peer address cannot be determined, access is denied (fail
+ * closed) for safety.
+ */
+static bool onboard_peer_is_on_softap(httpd_req_t *req)
+{
+    int sockfd = httpd_req_to_sockfd(req);
+    if (sockfd < 0) return false;
+
+    struct sockaddr_in6 addr = {0};
+    socklen_t addr_len = sizeof(addr);
+    if (getpeername(sockfd, (struct sockaddr *)&addr, &addr_len) != 0) {
+        return false;
+    }
+
+    uint32_t peer_ipv4 = 0;
+    if (addr.sin6_family == AF_INET) {
+        struct sockaddr_in *a4 = (struct sockaddr_in *)&addr;
+        peer_ipv4 = ntohl(a4->sin_addr.s_addr);
+    } else if (addr.sin6_family == AF_INET6) {
+        /* IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) */
+        const uint8_t *b = addr.sin6_addr.s6_addr;
+        bool mapped = (b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0 &&
+                       b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0 &&
+                       b[8] == 0 && b[9] == 0 && b[10] == 0xff && b[11] == 0xff);
+        if (!mapped) return false;
+        peer_ipv4 = ((uint32_t)b[12] << 24) | ((uint32_t)b[13] << 16) |
+                    ((uint32_t)b[14] << 8)  |  (uint32_t)b[15];
+    } else {
+        return false;
+    }
+
+    return (peer_ipv4 & MIMI_ONBOARD_AP_NETMASK) ==
+           (MIMI_ONBOARD_AP_SUBNET & MIMI_ONBOARD_AP_NETMASK);
+}
+
+/*
+ * Validate the HTTP Host header to mitigate DNS-rebinding attacks: we
+ * only accept the literal AP IP, an optional port, or loopback. This
+ * forces attackers to guess the exact Host we accept, which a rebound
+ * DNS name does not match.
+ */
+static bool onboard_host_header_is_allowed(httpd_req_t *req)
+{
+    char host[64] = {0};
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
+        /* A missing Host header is non-compliant in HTTP/1.1 and used
+         * by some rebinding attacks; reject it. */
+        return false;
+    }
+
+    /* Strip any trailing :port */
+    char *colon = strchr(host, ':');
+    if (colon) *colon = '\0';
+
+    static const char *const allowed[] = {
+        "192.168.4.1",
+        "mimiclaw.local",
+        "localhost",
+        "127.0.0.1",
+    };
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        if (strcasecmp(host, allowed[i]) == 0) return true;
+    }
+    return false;
+}
+
+/*
+ * Combined access guard for sensitive onboarding endpoints.
+ * Returns true if the request should be processed; false if it has
+ * already been responded to with a 403.
+ */
+static bool onboard_guard_request(httpd_req_t *req)
+{
+    if (!onboard_peer_is_on_softap(req)) {
+        ESP_LOGW(TAG, "Rejecting %s: peer not on Soft AP subnet", req->uri);
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                            "Onboarding endpoints are only accessible via the MimiClaw Soft AP");
+        return false;
+    }
+    if (!onboard_host_header_is_allowed(req)) {
+        ESP_LOGW(TAG, "Rejecting %s: disallowed Host header", req->uri);
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Disallowed Host");
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Security note: The onboarding HTTP server listens on an open WiFi AP
+ * (and, in admin mode, on the STA interface) without authentication.
+ * Returning raw secret values here would let any nearby client or any
+ * device on the same LAN exfiltrate every credential stored on the
+ * device (WiFi password, Telegram bot token, Anthropic/OpenAI API keys,
+ * Feishu app secret, etc.).
+ *
+ * To preserve usable UX for the setup flow, we only return:
+ *   - whether a value is set ("set": true/false)
+ *   - for non-sensitive fields (ssid, model, provider, proxy_host,
+ *     proxy_port, proxy_type) the actual value
+ *   - for sensitive fields a short masked preview suitable for
+ *     distinguishing between accounts (first 4 chars + "****")
+ */
+
+typedef struct {
+    bool sensitive;
+} json_config_opts_t;
+
+static void json_add_masked_preview(cJSON *root, const char *json_key,
+                                    const char *value, bool sensitive)
+{
+    cJSON *entry = cJSON_CreateObject();
+    bool is_set = (value && value[0] != '\0');
+    cJSON_AddBoolToObject(entry, "set", is_set);
+
+    if (!is_set) {
+        cJSON_AddStringToObject(entry, "value", "");
+    } else if (sensitive) {
+        /*
+         * Short, non-reversible preview so the client can tell which
+         * credential is stored without revealing it. For very short
+         * values we only indicate presence.
+         */
+        char preview[16];
+        size_t len = strlen(value);
+        if (len <= 4) {
+            snprintf(preview, sizeof(preview), "****");
+        } else {
+            snprintf(preview, sizeof(preview), "%.4s****", value);
+        }
+        cJSON_AddStringToObject(entry, "value", preview);
+        cJSON_AddBoolToObject(entry, "masked", true);
+    } else {
+        cJSON_AddStringToObject(entry, "value", value);
+    }
+
+    cJSON_AddItemToObject(root, json_key, entry);
+}
+
 static void json_add_effective_config(cJSON *root, const char *json_key,
                                       const char *ns, const char *nvs_key,
-                                      const char *build_val)
+                                      const char *build_val,
+                                      json_config_opts_t opts)
 {
     char value[256] = {0};
     bool found = false;
@@ -43,7 +195,7 @@ static void json_add_effective_config(cJSON *root, const char *json_key,
         strlcpy(value, build_val, sizeof(value));
     }
 
-    cJSON_AddStringToObject(root, json_key, value);
+    json_add_masked_preview(root, json_key, value, opts.sensitive);
 }
 
 static void json_add_effective_config_u16(cJSON *root, const char *json_key,
@@ -67,7 +219,8 @@ static void json_add_effective_config_u16(cJSON *root, const char *json_key,
         strlcpy(value, build_val, sizeof(value));
     }
 
-    cJSON_AddStringToObject(root, json_key, value);
+    /* Port numbers are not sensitive. */
+    json_add_masked_preview(root, json_key, value, false);
 }
 
 /* ── DNS hijack ─────────────────────────────────────────────────── */
@@ -160,6 +313,8 @@ static esp_err_t http_captive_redirect(httpd_req_t *req)
 
 static esp_err_t http_get_scan(httpd_req_t *req)
 {
+    if (!onboard_guard_request(req)) return ESP_FAIL;
+
     wifi_scan_config_t scan_cfg = {
         .ssid = NULL,
         .bssid = NULL,
@@ -209,25 +364,30 @@ static esp_err_t http_get_scan(httpd_req_t *req)
 
 static esp_err_t http_get_config(httpd_req_t *req)
 {
+    if (!onboard_guard_request(req)) return ESP_FAIL;
+
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
         return ESP_FAIL;
     }
 
-    json_add_effective_config(root, "ssid", MIMI_NVS_WIFI, MIMI_NVS_KEY_SSID, MIMI_SECRET_WIFI_SSID);
-    json_add_effective_config(root, "password", MIMI_NVS_WIFI, MIMI_NVS_KEY_PASS, MIMI_SECRET_WIFI_PASS);
-    json_add_effective_config(root, "api_key", MIMI_NVS_LLM, MIMI_NVS_KEY_API_KEY, MIMI_SECRET_API_KEY);
-    json_add_effective_config(root, "model", MIMI_NVS_LLM, MIMI_NVS_KEY_MODEL, MIMI_SECRET_MODEL);
-    json_add_effective_config(root, "provider", MIMI_NVS_LLM, MIMI_NVS_KEY_PROVIDER, MIMI_SECRET_MODEL_PROVIDER);
-    json_add_effective_config(root, "tg_token", MIMI_NVS_TG, MIMI_NVS_KEY_TG_TOKEN, MIMI_SECRET_TG_TOKEN);
-    json_add_effective_config(root, "feishu_app_id", MIMI_NVS_FEISHU, MIMI_NVS_KEY_FEISHU_APP_ID, MIMI_SECRET_FEISHU_APP_ID);
-    json_add_effective_config(root, "feishu_app_secret", MIMI_NVS_FEISHU, MIMI_NVS_KEY_FEISHU_APP_SECRET, MIMI_SECRET_FEISHU_APP_SECRET);
-    json_add_effective_config(root, "proxy_host", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_HOST, MIMI_SECRET_PROXY_HOST);
-    json_add_effective_config_u16(root, "proxy_port", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_PORT, MIMI_SECRET_PROXY_PORT);
-    json_add_effective_config(root, "proxy_type", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_TYPE, MIMI_SECRET_PROXY_TYPE);
-    json_add_effective_config(root, "search_key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_API_KEY, MIMI_SECRET_SEARCH_KEY);
-    json_add_effective_config(root, "tavily_key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_TAVILY_KEY, MIMI_SECRET_TAVILY_KEY);
+    const json_config_opts_t OPT_PUBLIC    = { .sensitive = false };
+    const json_config_opts_t OPT_SENSITIVE = { .sensitive = true  };
+
+    json_add_effective_config(root, "ssid",              MIMI_NVS_WIFI,   MIMI_NVS_KEY_SSID,              MIMI_SECRET_WIFI_SSID,         OPT_PUBLIC);
+    json_add_effective_config(root, "password",          MIMI_NVS_WIFI,   MIMI_NVS_KEY_PASS,              MIMI_SECRET_WIFI_PASS,         OPT_SENSITIVE);
+    json_add_effective_config(root, "api_key",           MIMI_NVS_LLM,    MIMI_NVS_KEY_API_KEY,           MIMI_SECRET_API_KEY,           OPT_SENSITIVE);
+    json_add_effective_config(root, "model",             MIMI_NVS_LLM,    MIMI_NVS_KEY_MODEL,             MIMI_SECRET_MODEL,             OPT_PUBLIC);
+    json_add_effective_config(root, "provider",          MIMI_NVS_LLM,    MIMI_NVS_KEY_PROVIDER,          MIMI_SECRET_MODEL_PROVIDER,    OPT_PUBLIC);
+    json_add_effective_config(root, "tg_token",          MIMI_NVS_TG,     MIMI_NVS_KEY_TG_TOKEN,          MIMI_SECRET_TG_TOKEN,          OPT_SENSITIVE);
+    json_add_effective_config(root, "feishu_app_id",     MIMI_NVS_FEISHU, MIMI_NVS_KEY_FEISHU_APP_ID,     MIMI_SECRET_FEISHU_APP_ID,     OPT_PUBLIC);
+    json_add_effective_config(root, "feishu_app_secret", MIMI_NVS_FEISHU, MIMI_NVS_KEY_FEISHU_APP_SECRET, MIMI_SECRET_FEISHU_APP_SECRET, OPT_SENSITIVE);
+    json_add_effective_config(root, "proxy_host",        MIMI_NVS_PROXY,  MIMI_NVS_KEY_PROXY_HOST,        MIMI_SECRET_PROXY_HOST,        OPT_PUBLIC);
+    json_add_effective_config_u16(root, "proxy_port",    MIMI_NVS_PROXY,  MIMI_NVS_KEY_PROXY_PORT,        MIMI_SECRET_PROXY_PORT);
+    json_add_effective_config(root, "proxy_type",        MIMI_NVS_PROXY,  MIMI_NVS_KEY_PROXY_TYPE,        MIMI_SECRET_PROXY_TYPE,        OPT_PUBLIC);
+    json_add_effective_config(root, "search_key",        MIMI_NVS_SEARCH, MIMI_NVS_KEY_API_KEY,           MIMI_SECRET_SEARCH_KEY,        OPT_SENSITIVE);
+    json_add_effective_config(root, "tavily_key",        MIMI_NVS_SEARCH, MIMI_NVS_KEY_TAVILY_KEY,        MIMI_SECRET_TAVILY_KEY,        OPT_SENSITIVE);
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -305,6 +465,8 @@ static void nvs_sync_u16_field(cJSON *root, const char *json_key,
 
 static esp_err_t http_post_save(httpd_req_t *req)
 {
+    if (!onboard_guard_request(req)) return ESP_FAIL;
+
     int total_len = req->content_len;
     if (total_len <= 0 || total_len > 2048) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad length");
@@ -392,15 +554,39 @@ static esp_err_t start_softap(bool keep_sta)
     (void)keep_sta;
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
 
+    /*
+     * Default to WPA2-PSK protected Soft AP so that passers-by cannot
+     * connect and reach the config portal (which holds API keys, bot
+     * tokens, and the user's WiFi credentials).
+     *
+     * The password is read from MIMI_ONBOARD_AP_PASS (mimi_secrets.h).
+     * If left empty or shorter than 8 characters — the WPA2 minimum —
+     * we derive a per-device password from the Soft AP MAC address so
+     * there is never an open credentials portal. The effective password
+     * is printed to the serial log on boot so the operator can read it.
+     */
     wifi_config_t ap_cfg = {
         .ap = {
             .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN,
+            .authmode = WIFI_AUTH_WPA2_PSK,
             .channel = 1,
+            .pmf_cfg = { .required = false },
         },
     };
     strncpy((char *)ap_cfg.ap.ssid, ssid, sizeof(ap_cfg.ap.ssid) - 1);
     ap_cfg.ap.ssid_len = strlen(ssid);
+
+    char derived_pass[17] = {0};
+    const char *configured_pass = MIMI_ONBOARD_AP_PASS;
+    const char *effective_pass = configured_pass;
+    if (!effective_pass || strlen(effective_pass) < 8) {
+        snprintf(derived_pass, sizeof(derived_pass),
+                 "mimi-%02x%02x%02x%02x%02x%02x",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        effective_pass = derived_pass;
+    }
+    strncpy((char *)ap_cfg.ap.password, effective_pass,
+            sizeof(ap_cfg.ap.password) - 1);
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     esp_err_t err = esp_wifi_start();
@@ -408,7 +594,8 @@ static esp_err_t start_softap(bool keep_sta)
         return err;
     }
 
-    ESP_LOGI(TAG, "Soft AP started: %s (open)", ssid);
+    ESP_LOGW(TAG, "Soft AP started: SSID=%s WPA2_PSK password=%s", ssid, effective_pass);
+    ESP_LOGW(TAG, "Write this password down — it is required to access the configuration portal.");
     return ESP_OK;
 }
 
