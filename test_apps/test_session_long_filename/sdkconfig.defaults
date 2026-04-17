@@ -1,0 +1,15 @@
+# Custom partition table with a SPIFFS slot for the regression test.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# Mirror the production fix from sdkconfig.defaults.
+# With the legacy default of 32, SPIFFS rejects session filenames
+# such as "/sessions/tg_<feishu_open_id>.jsonl" and fopen() fails
+# with "Cannot open session file".  The test explicitly asserts
+# this value is large enough at compile time as well.
+CONFIG_SPIFFS_OBJ_NAME_LEN=64
+
+# Minimal footprint for the test binary.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_ESP_TASK_WDT_INIT=n

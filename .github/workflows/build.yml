@@ -23,3 +23,12 @@ jobs:
           idf.py set-target esp32s3
           idf.py fullclean
           idf.py build
+
+      - name: Build regression test app — session_mgr long filename (ESP32-S3)
+        shell: bash
+        working-directory: test_apps/test_session_long_filename
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py set-target esp32s3
+          idf.py fullclean
+          idf.py build
