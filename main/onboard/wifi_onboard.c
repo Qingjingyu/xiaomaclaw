@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
@@ -22,6 +23,96 @@
 static const char *TAG = "onboard";
 static httpd_handle_t s_server = NULL;
 static bool s_captive_mode = false;
+
+/*
+ * Constant-time comparison to avoid timing-side-channel leaks of the admin
+ * token during brute-force attempts.
+ */
+static bool admin_token_equals(const char *a, const char *b)
+{
+    if (!a || !b) return false;
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    if (la != lb) return false;
+    volatile unsigned char diff = 0;
+    for (size_t i = 0; i < la; i++) {
+        diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
+    }
+    return diff == 0;
+}
+
+/*
+ * Load the shared admin token into `out`. Returns true iff a non-empty
+ * token is configured (build-time override wins, NVS overrides that).
+ */
+static bool admin_token_load(char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+
+    if (MIMI_SECRET_WS_TOKEN[0] != '\0') {
+        strlcpy(out, MIMI_SECRET_WS_TOKEN, out_size);
+    }
+
+    nvs_handle_t nvs;
+    if (nvs_open(MIMI_NVS_SECURITY, NVS_READONLY, &nvs) == ESP_OK) {
+        char tmp[256] = {0};
+        size_t len = sizeof(tmp);
+        if (nvs_get_str(nvs, MIMI_NVS_KEY_WS_TOKEN, tmp, &len) == ESP_OK && tmp[0]) {
+            strlcpy(out, tmp, out_size);
+        }
+        nvs_close(nvs);
+    }
+
+    return out[0] != '\0';
+}
+
+/*
+ * In non-captive (post-setup "admin") mode the portal is reachable over the
+ * user's main WiFi, so any LAN peer could otherwise rewrite the device's
+ * credentials. Gate mutating requests behind the shared WS/admin token:
+ *   Authorization: Bearer <token>
+ *   X-Auth-Token: <token>
+ *
+ * Captive mode (first-boot onboarding) intentionally skips this check — the
+ * device has no credentials yet and the user must be able to set them.
+ */
+static bool admin_request_authorized(httpd_req_t *req)
+{
+    if (s_captive_mode) {
+        return true;
+    }
+
+    char expected[256];
+    if (!admin_token_load(expected, sizeof(expected))) {
+        /* Default-deny mutations when no token is configured in admin mode. */
+        return false;
+    }
+
+    size_t auth_len = httpd_req_get_hdr_value_len(req, "Authorization");
+    if (auth_len > 0 && auth_len < 256) {
+        char auth[256];
+        if (httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof(auth)) == ESP_OK) {
+            const char prefix[] = "Bearer ";
+            size_t pfx = sizeof(prefix) - 1;
+            if (strncasecmp(auth, prefix, pfx) == 0) {
+                const char *tok = auth + pfx;
+                while (*tok == ' ') tok++;
+                if (admin_token_equals(tok, expected)) return true;
+            }
+        }
+    }
+
+    size_t xat_len = httpd_req_get_hdr_value_len(req, "X-Auth-Token");
+    if (xat_len > 0 && xat_len < 256) {
+        char xat[256];
+        if (httpd_req_get_hdr_value_str(req, "X-Auth-Token", xat, sizeof(xat)) == ESP_OK) {
+            if (admin_token_equals(xat, expected)) return true;
+        }
+    }
+
+    return false;
+}
 
 static void json_add_effective_config(cJSON *root, const char *json_key,
                                       const char *ns, const char *nvs_key,
@@ -44,6 +135,43 @@ static void json_add_effective_config(cJSON *root, const char *json_key,
     }
 
     cJSON_AddStringToObject(root, json_key, value);
+}
+
+/*
+ * Sensitive fields (passwords, API keys, tokens) must never be echoed back
+ * over the config portal in plaintext — doing so would let anyone on the
+ * local network exfiltrate every configured credential via a single
+ * unauthenticated HTTP GET. Instead, return an empty string for the value
+ * and a sibling "<key>_set" boolean so the UI can show a "(saved)" hint
+ * without revealing the secret itself.
+ */
+static void json_add_secret_flag(cJSON *root, const char *json_key,
+                                 const char *ns, const char *nvs_key,
+                                 const char *build_val)
+{
+    bool set = false;
+
+    nvs_handle_t nvs;
+    if (nvs_open(ns, NVS_READONLY, &nvs) == ESP_OK) {
+        size_t len = 0;
+        esp_err_t err = nvs_get_str(nvs, nvs_key, NULL, &len);
+        if ((err == ESP_OK || err == ESP_ERR_NVS_INVALID_LENGTH) && len > 1) {
+            set = true;
+        }
+        nvs_close(nvs);
+    }
+
+    if (!set && build_val && build_val[0] != '\0') {
+        set = true;
+    }
+
+    cJSON_AddStringToObject(root, json_key, "");
+
+    char flag_key[64];
+    int n = snprintf(flag_key, sizeof(flag_key), "%s_set", json_key);
+    if (n > 0 && (size_t)n < sizeof(flag_key)) {
+        cJSON_AddBoolToObject(root, flag_key, set);
+    }
 }
 
 static void json_add_effective_config_u16(cJSON *root, const char *json_key,
@@ -215,19 +343,22 @@ static esp_err_t http_get_config(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    /* Non-sensitive fields are returned in full. */
     json_add_effective_config(root, "ssid", MIMI_NVS_WIFI, MIMI_NVS_KEY_SSID, MIMI_SECRET_WIFI_SSID);
-    json_add_effective_config(root, "password", MIMI_NVS_WIFI, MIMI_NVS_KEY_PASS, MIMI_SECRET_WIFI_PASS);
-    json_add_effective_config(root, "api_key", MIMI_NVS_LLM, MIMI_NVS_KEY_API_KEY, MIMI_SECRET_API_KEY);
     json_add_effective_config(root, "model", MIMI_NVS_LLM, MIMI_NVS_KEY_MODEL, MIMI_SECRET_MODEL);
     json_add_effective_config(root, "provider", MIMI_NVS_LLM, MIMI_NVS_KEY_PROVIDER, MIMI_SECRET_MODEL_PROVIDER);
-    json_add_effective_config(root, "tg_token", MIMI_NVS_TG, MIMI_NVS_KEY_TG_TOKEN, MIMI_SECRET_TG_TOKEN);
     json_add_effective_config(root, "feishu_app_id", MIMI_NVS_FEISHU, MIMI_NVS_KEY_FEISHU_APP_ID, MIMI_SECRET_FEISHU_APP_ID);
-    json_add_effective_config(root, "feishu_app_secret", MIMI_NVS_FEISHU, MIMI_NVS_KEY_FEISHU_APP_SECRET, MIMI_SECRET_FEISHU_APP_SECRET);
     json_add_effective_config(root, "proxy_host", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_HOST, MIMI_SECRET_PROXY_HOST);
     json_add_effective_config_u16(root, "proxy_port", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_PORT, MIMI_SECRET_PROXY_PORT);
     json_add_effective_config(root, "proxy_type", MIMI_NVS_PROXY, MIMI_NVS_KEY_PROXY_TYPE, MIMI_SECRET_PROXY_TYPE);
-    json_add_effective_config(root, "search_key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_API_KEY, MIMI_SECRET_SEARCH_KEY);
-    json_add_effective_config(root, "tavily_key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_TAVILY_KEY, MIMI_SECRET_TAVILY_KEY);
+
+    /* Sensitive fields are never echoed back — only a boolean "is set" flag. */
+    json_add_secret_flag(root, "password", MIMI_NVS_WIFI, MIMI_NVS_KEY_PASS, MIMI_SECRET_WIFI_PASS);
+    json_add_secret_flag(root, "api_key", MIMI_NVS_LLM, MIMI_NVS_KEY_API_KEY, MIMI_SECRET_API_KEY);
+    json_add_secret_flag(root, "tg_token", MIMI_NVS_TG, MIMI_NVS_KEY_TG_TOKEN, MIMI_SECRET_TG_TOKEN);
+    json_add_secret_flag(root, "feishu_app_secret", MIMI_NVS_FEISHU, MIMI_NVS_KEY_FEISHU_APP_SECRET, MIMI_SECRET_FEISHU_APP_SECRET);
+    json_add_secret_flag(root, "search_key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_API_KEY, MIMI_SECRET_SEARCH_KEY);
+    json_add_secret_flag(root, "tavily_key", MIMI_NVS_SEARCH, MIMI_NVS_KEY_TAVILY_KEY, MIMI_SECRET_TAVILY_KEY);
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -305,6 +436,14 @@ static void nvs_sync_u16_field(cJSON *root, const char *json_key,
 
 static esp_err_t http_post_save(httpd_req_t *req)
 {
+    if (!admin_request_authorized(req)) {
+        ESP_LOGW(TAG, "Rejecting /save: missing or invalid admin token");
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer realm=\"mimi-admin\"");
+        httpd_resp_send(req, "unauthorized", 12);
+        return ESP_FAIL;
+    }
+
     int total_len = req->content_len;
     if (total_len <= 0 || total_len > 2048) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad length");

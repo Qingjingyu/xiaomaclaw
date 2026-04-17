@@ -46,6 +46,18 @@
 #ifndef MIMI_SECRET_TAVILY_KEY
 #define MIMI_SECRET_TAVILY_KEY      ""
 #endif
+#ifndef MIMI_SECRET_WS_TOKEN
+/*
+ * Shared bearer token for the WebSocket gateway AND the local admin portal
+ * write endpoints. When empty:
+ *   - WebSocket /ws handshakes are refused (default-deny).
+ *   - The admin portal /save endpoint is refused in non-captive (post-setup)
+ *     mode, so an attacker on the LAN cannot rewrite the device config.
+ * Set via mimi_secrets.h at build time, or via the CLI command `set_ws_token`
+ * at runtime.
+ */
+#define MIMI_SECRET_WS_TOKEN        ""
+#endif
 
 /* WiFi */
 #define MIMI_WIFI_MAX_RETRY          10
@@ -139,6 +151,7 @@
 #define MIMI_NVS_LLM                 "llm_config"
 #define MIMI_NVS_PROXY               "proxy_config"
 #define MIMI_NVS_SEARCH              "search_config"
+#define MIMI_NVS_SECURITY            "security"
 
 /* NVS Keys */
 #define MIMI_NVS_KEY_SSID            "ssid"
@@ -153,6 +166,7 @@
 #define MIMI_NVS_KEY_PROXY_HOST      "host"
 #define MIMI_NVS_KEY_PROXY_PORT      "port"
 #define MIMI_NVS_KEY_PROXY_TYPE      "proxy_type"
+#define MIMI_NVS_KEY_WS_TOKEN        "ws_token"
 
 /* WiFi Onboarding (Captive Portal) */
 #define MIMI_ONBOARD_AP_PREFIX    "MimiClaw-"
