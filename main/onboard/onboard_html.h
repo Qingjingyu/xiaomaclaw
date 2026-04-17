@@ -113,11 +113,19 @@ static const char ONBOARD_HTML[] =
 "function toggle(el){"
 "el.parentElement.classList.toggle('collapsed')}"
 
+"var SECRET_FIELDS=['password','api_key','tg_token','feishu_app_secret','search_key','tavily_key'];"
+
 "function loadConfig(){"
 "fetch('/config').then(r=>r.json()).then(cfg=>{"
 "Object.keys(cfg).forEach(k=>{"
+"if(k.endsWith('_set'))return;"
 "var el=document.getElementById(k);"
-"if(el && cfg[k] !== undefined && cfg[k] !== null){el.value=cfg[k]}"
+"if(!el||cfg[k]===undefined||cfg[k]===null)return;"
+/* Secrets are never echoed back — show a placeholder if the backend
+ * reported the value is set, so the user knows not to clear it. */
+"if(SECRET_FIELDS.indexOf(k)>=0){"
+"if(cfg[k+'_set']){el.placeholder='(saved — leave blank to keep)';}"
+"}else{el.value=cfg[k]}"
 "})"
 "}).catch(()=>{})}"
 
@@ -137,7 +145,13 @@ static const char ONBOARD_HTML[] =
 "var fields=['ssid','password','api_key','model','provider','tg_token',"
 "'feishu_app_id','feishu_app_secret','proxy_host','proxy_port','proxy_type','search_key','tavily_key'];"
 "var data={};"
-"fields.forEach(f=>{data[f]=document.getElementById(f).value.trim()});"
+"fields.forEach(f=>{"
+"var v=document.getElementById(f).value.trim();"
+/* For secret fields: omit the key entirely when the user leaves it blank,
+ * so the backend keeps the currently-saved value instead of erasing it. */
+"if(SECRET_FIELDS.indexOf(f)>=0&&v===''){return;}"
+"data[f]=v;"
+"});"
 "document.getElementById('status').style.display='block';"
 "fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})"
 ".then(()=>{document.getElementById('status').textContent='Saved! Restarting...';})"

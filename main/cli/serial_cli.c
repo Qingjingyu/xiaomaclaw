@@ -135,6 +135,62 @@ static int cmd_set_api_key(int argc, char **argv)
     return 0;
 }
 
+/* --- set_ws_token / clear_ws_token commands --- */
+static struct {
+    struct arg_str *token;
+    struct arg_end *end;
+} ws_token_args;
+
+static int cmd_set_ws_token(int argc, char **argv)
+{
+    int nerrors = arg_parse(argc, argv, (void **)&ws_token_args);
+    if (nerrors != 0) {
+        arg_print_errors(stderr, ws_token_args.end, argv[0]);
+        return 1;
+    }
+    const char *token = ws_token_args.token->sval[0];
+    if (!token || token[0] == '\0') {
+        printf("Error: token must not be empty. Use clear_ws_token to disable.\n");
+        return 1;
+    }
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(MIMI_NVS_SECURITY, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        printf("nvs_open failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    err = nvs_set_str(nvs, MIMI_NVS_KEY_WS_TOKEN, token);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err != ESP_OK) {
+        printf("Failed to save ws_token: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    printf("WS/admin auth token saved. Reboot for WS gateway to pick it up.\n");
+    return 0;
+}
+
+static int cmd_clear_ws_token(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(MIMI_NVS_SECURITY, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        printf("nvs_open failed: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+    err = nvs_erase_key(nvs, MIMI_NVS_KEY_WS_TOKEN);
+    if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_commit(nvs);
+        err = ESP_OK;
+    }
+    nvs_close(nvs);
+    printf("WS/admin auth token cleared. WebSocket gateway will reject all "
+           "connections until a new token is set.\n");
+    return 0;
+}
+
 /* --- set_model command --- */
 static struct {
     struct arg_str *model;
@@ -874,6 +930,25 @@ esp_err_t serial_cli_init(void)
         .argtable = &api_key_args,
     };
     esp_console_cmd_register(&api_key_cmd);
+
+    /* set_ws_token */
+    ws_token_args.token = arg_str1(NULL, NULL, "<token>", "Shared bearer token for WS gateway + admin portal /save");
+    ws_token_args.end = arg_end(1);
+    esp_console_cmd_t ws_token_cmd = {
+        .command = "set_ws_token",
+        .help = "Set shared auth token for WebSocket gateway and admin /save endpoint",
+        .func = &cmd_set_ws_token,
+        .argtable = &ws_token_args,
+    };
+    esp_console_cmd_register(&ws_token_cmd);
+
+    /* clear_ws_token */
+    esp_console_cmd_t ws_token_clear_cmd = {
+        .command = "clear_ws_token",
+        .help = "Clear the WS/admin auth token (WebSocket gateway will refuse all connections)",
+        .func = &cmd_clear_ws_token,
+    };
+    esp_console_cmd_register(&ws_token_clear_cmd);
 
     /* set_model */
     model_args.model = arg_str1(NULL, NULL, "<model>", "Model identifier");
